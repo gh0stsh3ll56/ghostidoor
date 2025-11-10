@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GhostIDOR v2.4 - Comprehensive IDOR Vulnerability Scanner
+GhostIDOR v2.5 - Comprehensive IDOR Vulnerability Scanner
 Developed for Ghost Ops Security
 
 NEW in v2.3:
@@ -267,6 +267,429 @@ class SmartRecon:
         if base_path:
             return f"{parsed.scheme}://{parsed.netloc}{base_path}/{link}"
         return f"{parsed.scheme}://{parsed.netloc}/{link}"
+
+
+
+
+class APIIDORTester:
+    """NEW v2.5: Comprehensive API IDOR testing with multi-method support"""
+    
+    def __init__(self, session: requests.Session, args):
+        self.session = session
+        self.args = args
+        self.discovered_endpoints = []
+        self.discovered_users = []
+        self.api_schema = {}
+        self.admin_roles = []
+        
+    def discover_api_endpoints(self, base_url: str) -> List[str]:
+        """Discover API endpoints from the target"""
+        print(f"\n{Colors.BLUE}[*]{Colors.RESET} Discovering API endpoints...")
+        
+        endpoints = []
+        common_api_paths = [
+            '/api', '/api/v1', '/api/v2',
+            '/profile/api.php', '/user/api', '/users/api',
+            '/api/user', '/api/users', '/api/profile',
+            '/api.php', '/rest/api', '/v1/api',
+            '/api/account', '/api/accounts',
+            '/api/customer', '/api/customers',
+            '/api/admin', '/api/administrator'
+        ]
+        
+        parsed = urlparse(base_url)
+        base_domain = f"{parsed.scheme}://{parsed.netloc}"
+        
+        for path in common_api_paths:
+            test_url = base_domain + path
+            try:
+                # Test with uid parameter
+                for param in ['?uid=1', '?id=1', '?user_id=1', '/1', '']:
+                    full_url = test_url + param
+                    response = self.session.get(full_url, timeout=5)
+                    
+                    # Check if it looks like an API
+                    if response.status_code in [200, 401, 403]:
+                        content_type = response.headers.get('Content-Type', '')
+                        if 'json' in content_type.lower() or self._is_json(response.text):
+                            endpoints.append(test_url)
+                            print(f"  {Colors.GREEN}[+] Found API:{Colors.RESET} {test_url}")
+                            break
+            except:
+                continue
+        
+        # Also check the provided URL
+        try:
+            response = self.session.get(base_url, timeout=5)
+            content_type = response.headers.get('Content-Type', '')
+            if 'json' in content_type.lower() or self._is_json(response.text):
+                if base_url not in endpoints:
+                    endpoints.append(base_url)
+                    print(f"  {Colors.GREEN}[+] Target is API:{Colors.RESET} {base_url}")
+        except:
+            pass
+        
+        return endpoints if endpoints else [base_url]
+    
+    @staticmethod
+    def _is_json(text: str) -> bool:
+        """Check if text is valid JSON"""
+        try:
+            json.loads(text)
+            return True
+        except:
+            return False
+    
+    def extract_api_parameters(self, response_data: Dict) -> Dict:
+        """Extract parameter names and types from API response"""
+        params = {}
+        
+        if isinstance(response_data, dict):
+            for key, value in response_data.items():
+                params[key] = type(value).__name__
+        
+        return params
+    
+    def enumerate_users(self, api_url: str, max_users: int = 100) -> List[Dict]:
+        """Enumerate users via API IDOR"""
+        print(f"\n{Colors.BLUE}[*]{Colors.RESET} Enumerating users via API...")
+        
+        users = []
+        param_names = ['uid', 'id', 'user_id', 'userId', 'user']
+        
+        # Try to determine the correct parameter
+        working_param = None
+        for param in param_names:
+            test_url = self._build_api_url(api_url, param, 1)
+            try:
+                response = self.session.get(test_url, timeout=5)
+                if response.status_code == 200 and self._is_json(response.text):
+                    working_param = param
+                    print(f"  {Colors.GREEN}[+] Working parameter:{Colors.RESET} {param}")
+                    break
+            except:
+                continue
+        
+        if not working_param:
+            print(f"  {Colors.YELLOW}[-] Could not determine API parameter{Colors.RESET}")
+            return users
+        
+        # Enumerate users
+        for uid in range(1, max_users + 1):
+            test_url = self._build_api_url(api_url, working_param, uid)
+            
+            try:
+                response = self.session.get(test_url, timeout=5)
+                
+                if response.status_code == 200 and self._is_json(response.text):
+                    user_data = json.loads(response.text)
+                    users.append(user_data)
+                    
+                    # Extract role if present
+                    role = user_data.get('role', user_data.get('user_role', 'unknown'))
+                    email = user_data.get('email', 'N/A')
+                    
+                    print(f"  {Colors.CYAN}[{uid}]{Colors.RESET} Role: {role} | Email: {email[:30]}")
+                    
+                    # Track admin roles
+                    if 'admin' in str(role).lower():
+                        self.admin_roles.append(role)
+                        print(f"    {Colors.RED}[!] ADMIN ROLE FOUND:{Colors.RESET} {role}")
+                
+                elif response.status_code == 404:
+                    # User not found, continue
+                    continue
+                elif response.status_code in [401, 403]:
+                    # Authorization required
+                    break
+                    
+            except Exception as e:
+                if self.args.verbose:
+                    print(f"  {Colors.YELLOW}[!] Error testing uid {uid}: {e}{Colors.RESET}")
+                continue
+            
+            # Small delay to avoid rate limiting
+            time.sleep(0.05)
+        
+        print(f"  {Colors.GREEN}[+] Enumerated {len(users)} users{Colors.RESET}")
+        return users
+    
+    def _build_api_url(self, base_url: str, param: str, value: any) -> str:
+        """Build API URL with parameter"""
+        parsed = urlparse(base_url)
+        
+        # Check if URL already has query params
+        if parsed.query:
+            # Replace existing parameter or add new one
+            params = parse_qs(parsed.query)
+            params[param] = [str(value)]
+            new_query = urlencode(params, doseq=True)
+            return urlunparse((
+                parsed.scheme, parsed.netloc, parsed.path,
+                parsed.params, new_query, parsed.fragment
+            ))
+        else:
+            # Add as query parameter
+            return f"{base_url}?{param}={value}"
+    
+    def test_api_methods(self, api_url: str, user_data: Dict) -> List[IDORResult]:
+        """Test different HTTP methods on API endpoint"""
+        print(f"\n{Colors.BLUE}[*]{Colors.RESET} Testing API methods (GET, POST, PUT, DELETE)...")
+        
+        results = []
+        methods = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH']
+        
+        uid = user_data.get('uid', user_data.get('id', user_data.get('user_id', 1)))
+        
+        for method in methods:
+            print(f"  {Colors.CYAN}Testing {method}...{Colors.RESET}")
+            
+            # Build URL with uid
+            test_url = self._build_api_url(api_url, 'uid', uid)
+            
+            try:
+                if method == 'GET':
+                    response = self.session.get(test_url, timeout=10)
+                elif method == 'POST':
+                    response = self.session.post(test_url, json=user_data, timeout=10)
+                elif method == 'PUT':
+                    # Try to modify the user
+                    modified_data = user_data.copy()
+                    modified_data['about'] = 'IDOR_TEST_MODIFY'
+                    response = self.session.put(test_url, json=modified_data, timeout=10)
+                elif method == 'DELETE':
+                    response = self.session.delete(test_url, timeout=10)
+                elif method == 'PATCH':
+                    response = self.session.patch(test_url, json={'about': 'IDOR_TEST'}, timeout=10)
+                
+                # Analyze response
+                if response.status_code in [200, 201, 204]:
+                    print(f"    {Colors.GREEN}[+] {method} successful:{Colors.RESET} {response.status_code}")
+                    
+                    # Check if modification worked (for PUT/PATCH)
+                    if method in ['PUT', 'PATCH']:
+                        verify_response = self.session.get(test_url, timeout=5)
+                        if 'IDOR_TEST' in verify_response.text:
+                            print(f"      {Colors.RED}[!] CRITICAL: Can modify user data!{Colors.RESET}")
+                            
+                            result = IDORResult(
+                                url=test_url,
+                                method=method,
+                                parameter='API Body',
+                                original_value=str(uid),
+                                tested_value=str(uid),
+                                status_code=response.status_code,
+                                response_length=len(response.text),
+                                response_hash=hashlib.md5(response.text.encode()).hexdigest(),
+                                vulnerable=True,
+                                evidence=f"Successfully modified user {uid} data via {method}",
+                                technique=f"API IDOR - {method} Method",
+                                confidence="critical",
+                                request_headers=dict(response.request.headers),
+                                response_headers=dict(response.headers),
+                                response_body=response.text[:5000]
+                            )
+                            results.append(result)
+                    
+                    # Check if DELETE worked
+                    elif method == 'DELETE':
+                        verify_response = self.session.get(test_url, timeout=5)
+                        if verify_response.status_code == 404:
+                            print(f"      {Colors.RED}[!] CRITICAL: Can delete users!{Colors.RESET}")
+                
+                elif response.status_code in [401, 403]:
+                    print(f"    {Colors.YELLOW}[-] {method} forbidden:{Colors.RESET} {response.status_code}")
+                    
+            except Exception as e:
+                if self.args.verbose:
+                    print(f"    {Colors.YELLOW}[!] Error: {e}{Colors.RESET}")
+        
+        return results
+    
+    def test_role_escalation(self, api_url: str, current_user: Dict) -> List[IDORResult]:
+        """Test if we can escalate our role to admin"""
+        print(f"\n{Colors.BLUE}[*]{Colors.RESET} Testing role escalation...")
+        
+        results = []
+        
+        # Get current role
+        current_role = current_user.get('role', 'user')
+        uid = current_user.get('uid', current_user.get('id', 1))
+        
+        print(f"  {Colors.CYAN}Current role:{Colors.RESET} {current_role}")
+        
+        # Test various admin roles
+        admin_roles = [
+            'admin', 'administrator', 'web_admin', 'webadmin',
+            'superadmin', 'super_admin', 'root', 'sysadmin',
+            'moderator', 'manager'
+        ]
+        
+        # Add discovered admin roles
+        admin_roles.extend(self.admin_roles)
+        admin_roles = list(set(admin_roles))  # Remove duplicates
+        
+        test_url = self._build_api_url(api_url, 'uid', uid)
+        
+        for admin_role in admin_roles:
+            try:
+                # Attempt to change role
+                modified_data = current_user.copy()
+                modified_data['role'] = admin_role
+                
+                response = self.session.put(test_url, json=modified_data, timeout=10)
+                
+                if response.status_code in [200, 201]:
+                    # Verify if role was changed
+                    verify_response = self.session.get(test_url, timeout=5)
+                    
+                    if verify_response.status_code == 200:
+                        verify_data = json.loads(verify_response.text)
+                        new_role = verify_data.get('role', '')
+                        
+                        if new_role == admin_role:
+                            print(f"  {Colors.RED}[!] CRITICAL: Role escalation successful!{Colors.RESET}")
+                            print(f"    {Colors.CYAN}Escalated to:{Colors.RESET} {admin_role}")
+                            
+                            result = IDORResult(
+                                url=test_url,
+                                method='PUT',
+                                parameter='role',
+                                original_value=current_role,
+                                tested_value=admin_role,
+                                status_code=response.status_code,
+                                response_length=len(response.text),
+                                response_hash=hashlib.md5(response.text.encode()).hexdigest(),
+                                vulnerable=True,
+                                evidence=f"Role escalation: {current_role} -> {admin_role}",
+                                technique="API IDOR - Role Escalation",
+                                confidence="critical",
+                                request_headers=dict(response.request.headers),
+                                request_body=json.dumps(modified_data),
+                                response_headers=dict(response.headers),
+                                response_body=response.text[:5000]
+                            )
+                            results.append(result)
+                            
+                            # Update cookie if present
+                            if 'role' in self.session.cookies:
+                                self.session.cookies.set('role', admin_role)
+                                print(f"    {Colors.GREEN}[+] Cookie updated to role={admin_role}{Colors.RESET}")
+                            
+                            break  # Found working escalation
+                        
+            except Exception as e:
+                if self.args.verbose:
+                    print(f"  {Colors.YELLOW}[!] Error testing {admin_role}: {e}{Colors.RESET}")
+        
+        return results
+    
+    def test_json_parameter_idor(self, api_url: str, base_user: Dict, payloads: List[str]) -> List[IDORResult]:
+        """Test IDOR by fuzzing JSON body parameters"""
+        print(f"\n{Colors.BLUE}[*]{Colors.RESET} Testing JSON parameter IDOR...")
+        
+        results = []
+        
+        # Identify ID parameters in JSON
+        id_params = []
+        for key in base_user.keys():
+            if any(id_str in key.lower() for id_str in ['id', 'uid', 'user', 'account']):
+                id_params.append(key)
+        
+        if not id_params:
+            print(f"  {Colors.YELLOW}[-] No ID parameters found in JSON{Colors.RESET}")
+            return results
+        
+        print(f"  {Colors.CYAN}Testing parameters:{Colors.RESET} {', '.join(id_params)}")
+        
+        # Test each parameter with payloads
+        for param in id_params:
+            original_value = base_user.get(param)
+            
+            for payload in payloads[:20]:  # Test first 20 payloads
+                test_data = base_user.copy()
+                test_data[param] = payload
+                
+                try:
+                    # Try GET first
+                    response = self.session.post(api_url, json=test_data, timeout=10)
+                    
+                    if response.status_code == 200 and self._is_json(response.text):
+                        response_data = json.loads(response.text)
+                        
+                        # Check if we got different user data
+                        if response_data.get(param) != original_value:
+                            print(f"  {Colors.GREEN}[+] IDOR found:{Colors.RESET} {param}={payload}")
+                            
+                            result = IDORResult(
+                                url=api_url,
+                                method='POST',
+                                parameter=param,
+                                original_value=str(original_value),
+                                tested_value=str(payload),
+                                status_code=response.status_code,
+                                response_length=len(response.text),
+                                response_hash=hashlib.md5(response.text.encode()).hexdigest(),
+                                vulnerable=True,
+                                evidence=f"Accessed different user data via JSON param {param}",
+                                technique="API IDOR - JSON Body Parameter",
+                                confidence="high",
+                                request_headers=dict(response.request.headers),
+                                request_body=json.dumps(test_data),
+                                response_headers=dict(response.headers),
+                                response_body=response.text[:5000]
+                            )
+                            results.append(result)
+                
+                except Exception as e:
+                    if self.args.verbose:
+                        print(f"  {Colors.YELLOW}[!] Error: {e}{Colors.RESET}")
+                
+                time.sleep(0.05)  # Small delay
+        
+        return results
+    
+    def run_comprehensive_api_test(self, url: str) -> List[IDORResult]:
+        """Run comprehensive API IDOR testing"""
+        print(f"\n{Colors.BOLD}{Colors.GHOST}╔═══════════════════════════════════════════════════════════════════╗{Colors.RESET}")
+        print(f"{Colors.BOLD}{Colors.GHOST}║              API IDOR TESTING - Comprehensive Mode                ║{Colors.RESET}")
+        print(f"{Colors.BOLD}{Colors.GHOST}╚═══════════════════════════════════════════════════════════════════╝{Colors.RESET}\n")
+        
+        all_results = []
+        
+        # Step 1: Discover API endpoints
+        endpoints = self.discover_api_endpoints(url)
+        
+        for endpoint in endpoints:
+            print(f"\n{Colors.BOLD}{'='*70}{Colors.RESET}")
+            print(f"{Colors.BOLD}Testing endpoint: {endpoint}{Colors.RESET}")
+            print(f"{Colors.BOLD}{'='*70}{Colors.RESET}")
+            
+            # Step 2: Enumerate users
+            users = self.enumerate_users(endpoint, max_users=50)
+            
+            if not users:
+                print(f"  {Colors.YELLOW}[-] No users enumerated{Colors.RESET}")
+                continue
+            
+            # Use first user as baseline
+            base_user = users[0] if users else None
+            
+            if base_user:
+                # Step 3: Test different HTTP methods
+                method_results = self.test_api_methods(endpoint, base_user)
+                all_results.extend(method_results)
+                
+                # Step 4: Test role escalation
+                escalation_results = self.test_role_escalation(endpoint, base_user)
+                all_results.extend(escalation_results)
+                
+                # Step 5: Test JSON parameter IDOR
+                payloads = [str(i) for i in range(1, 21)]
+                json_results = self.test_json_parameter_idor(endpoint, base_user, payloads)
+                all_results.extend(json_results)
+        
+        return all_results
 
 
 class JavaScriptAnalyzer:
@@ -920,6 +1343,7 @@ class GhostIDOR:
         self.args = args
         self.smart_recon_result = None
         self.session = self._create_session()
+        self.api_tester = APIIDORTester(self.session, self.args)
         self.results = []
         self.baseline_responses = {}
         self.encoding_detector = EncodingDetector()
@@ -976,7 +1400,7 @@ class GhostIDOR:
   \\_____|_| |_|\\___/|___/\\__|_____|_____/ \\____/|_|  \\_\\
 {Colors.RESET}
 {Colors.CYAN}        Comprehensive IDOR Vulnerability Scanner{Colors.RESET}
-{Colors.CYAN}        v2.4 - Smart Recon & Automated Exploitation{Colors.RESET}
+{Colors.CYAN}        v2.5 - API IDOR Testing & Role Escalation{Colors.RESET}
 {Colors.DIM}              Ghost Ops Security - Red Team Tools{Colors.RESET}
 {Colors.DIM}        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{Colors.RESET}
 """
@@ -1325,10 +1749,16 @@ class GhostIDOR:
         """Fuzz a specific parameter with payloads"""
         results = []
         
-        # Parse parameter specification (e.g., "uid=FUZZ")
+        # Parse parameter specification (e.g., "uid=FUZZ" or just "FUZZ" for path fuzzing)
         if '=' not in param_spec:
-            print(f"{Colors.RED}[!] Invalid parameter specification. Use format: param=FUZZ{Colors.RESET}")
-            return results
+            # Check if URL has FUZZ marker for path fuzzing
+            if 'FUZZ' in url:
+                print(f"{Colors.YELLOW}[*] Path fuzzing mode detected{Colors.RESET}")
+                return self._fuzz_url_path(url, payloads)
+            else:
+                print(f"{Colors.RED}[!] Invalid parameter specification. Use format: param=FUZZ{Colors.RESET}")
+                print(f"{Colors.YELLOW}[*] For path fuzzing, put FUZZ in the URL: /profile/FUZZ{Colors.RESET}")
+                return results
         
         param_name, marker = param_spec.split('=', 1)
         
@@ -1775,11 +2205,171 @@ class GhostIDOR:
         
         return results
     
+    
+    def _fuzz_url_path(self, url_template: str, payloads: List[str]) -> List[IDORResult]:
+        """Fuzz URL path (e.g., /profile/FUZZ)"""
+        results = []
+        
+        print(f"\n{Colors.BLUE}[*]{Colors.RESET} Fuzzing URL path")
+        print(f"  {Colors.CYAN}Template:{Colors.RESET} {url_template}")
+        print(f"  {Colors.CYAN}Payloads:{Colors.RESET} {len(payloads)}")
+        print(f"  {Colors.CYAN}Threads:{Colors.RESET} {self.args.threads}")
+        print(f"  {Colors.CYAN}Method:{Colors.RESET} {self.args.method}")
+        
+        # Get baseline with invalid ID
+        baseline_url = url_template.replace('FUZZ', '999999')
+        print(f"\n{Colors.BLUE}[*]{Colors.RESET} Establishing baseline...")
+        baseline_response = self._send_request(baseline_url, self.args.method)
+        
+        if not baseline_response:
+            print(f"{Colors.RED}[!] Failed to get baseline response{Colors.RESET}")
+            return results
+        
+        baseline_hash = self._hash_response(baseline_response.text)
+        print(f"  {Colors.GREEN}Baseline established:{Colors.RESET} {baseline_response.status_code} ({len(baseline_response.content)} bytes)")
+        
+        # Start fuzzing
+        print(f"\n{Colors.BOLD}{Colors.GHOST}[*] Starting path fuzzing attack...{Colors.RESET}\n")
+        
+        with ThreadPoolExecutor(max_workers=self.args.threads) as executor:
+            futures = []
+            
+            for payload in payloads:
+                future = executor.submit(
+                    self._test_path_payload,
+                    url_template,
+                    payload,
+                    baseline_response,
+                    baseline_hash
+                )
+                futures.append(future)
+            
+            for future in as_completed(futures):
+                try:
+                    result = future.result()
+                    if result:
+                        results.append(result)
+                except Exception as e:
+                    if self.args.verbose:
+                        print(f"\n{Colors.RED}[!] Thread error: {e}{Colors.RESET}")
+        
+        print(f"\n\n{Colors.GREEN}[+] Path fuzzing complete!{Colors.RESET}")
+        print(f"  {Colors.CYAN}Total tested:{Colors.RESET} {self.tested_count}")
+        print(f"  {Colors.CYAN}Vulnerabilities found:{Colors.RESET} {self.found_count}")
+        
+        return results
+    
+    def _test_path_payload(self, url_template: str, payload: str,
+                          baseline_response: requests.Response, baseline_hash: str) -> Optional[IDORResult]:
+        """Test a single path payload"""
+        try:
+            # Build URL with payload
+            test_url = url_template.replace('FUZZ', str(payload))
+            
+            # Send request
+            response = self._send_request(test_url, self.args.method)
+            self._update_progress()
+            
+            if not response:
+                return None
+            
+            response_hash = self._hash_response(response.text)
+            
+            # Check for IDOR
+            is_vulnerable = self._analyze_idor(
+                baseline_response, response,
+                baseline_hash, response_hash
+            )
+            
+            # Check for success
+            success_indicators = [
+                response.status_code in [200, 201, 202],
+                len(response.content) > 100,
+                'application/json' in response.headers.get('Content-Type', ''),
+            ]
+            
+            has_content = any(success_indicators)
+            
+            if is_vulnerable or has_content:
+                # Capture request/response
+                capture = self._capture_request_response(response, self.args.method)
+                
+                # Try to extract/parse response
+                saved_file = None
+                file_info = None
+                
+                if response.status_code == 200 and len(response.content) > 0:
+                    try:
+                        # Check if it's JSON
+                        if 'application/json' in response.headers.get('Content-Type', ''):
+                            data = json.loads(response.text)
+                            # Print interesting fields
+                            interesting_fields = ['email', 'role', 'full_name', 'about', 'uuid', 'uid']
+                            extracted = {k: v for k, v in data.items() if k in interesting_fields}
+                            if extracted:
+                                print(f"\n{Colors.GREEN}[+] FOUND:{Colors.RESET} {test_url}")
+                                print(f"    {Colors.CYAN}Extracted data:{Colors.RESET}")
+                                for key, value in extracted.items():
+                                    print(f"      {key}: {value}")
+                        
+                        # Try to save as file
+                        file_info = self.file_extractor.save_file(response, 'path', payload)
+                        saved_file = file_info['filepath']
+                    except:
+                        pass
+                
+                result = IDORResult(
+                    url=test_url,
+                    method=self.args.method,
+                    parameter='URL Path',
+                    original_value='N/A',
+                    tested_value=str(payload),
+                    status_code=response.status_code,
+                    response_length=len(response.text),
+                    response_hash=response_hash,
+                    vulnerable=is_vulnerable or has_content,
+                    evidence=self._extract_evidence(response),
+                    technique="Path Fuzzing",
+                    confidence="high" if is_vulnerable else "medium",
+                    saved_file=saved_file,
+                    file_info=file_info,
+                    **capture
+                )
+                
+                with self.results_lock:
+                    self.found_count += 1
+                    self.results.append(result)
+                
+                if self.args.verbose:
+                    self._print_vulnerability_details(result)
+                
+                return result
+            
+            # Delay if specified
+            if self.args.delay > 0:
+                time.sleep(self.args.delay)
+            
+            return None
+            
+        except Exception as e:
+            if self.args.verbose:
+                print(f"\n{Colors.RED}[!] Error testing {payload}: {e}{Colors.RESET}")
+            return None
+    
     def run_all_tests(self, url: str) -> List[IDORResult]:
         """Run all IDOR tests on a URL"""
         all_results = []
         
         print(f"\n{Colors.BOLD}{Colors.GHOST}[*] Target: {url}{Colors.RESET}\n")
+        
+        # API IDOR Testing Mode
+        if self.args.api_test:
+            api_results = self.api_tester.run_comprehensive_api_test(url)
+            all_results.extend(api_results)
+            print(f"\n{Colors.GREEN}[+] API testing complete!{Colors.RESET}")
+            print(f"  {Colors.CYAN}API vulnerabilities found:{Colors.RESET} {len(api_results)}")
+            if not self.args.fuzz_param:
+                return all_results
         
         # Smart Recon Mode
         if self.args.smart_recon:
@@ -1951,7 +2541,7 @@ class GhostIDOR:
 
 def main():
     parser = argparse.ArgumentParser(
-        description='GhostIDOR v2.4 - IDOR Scanner with High-Speed Fuzzing & File Extraction',
+        description='GhostIDOR v2.5 - IDOR Scanner with High-Speed Fuzzing & File Extraction',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f"""
 {Colors.CYAN}Examples:{Colors.RESET}
@@ -2016,6 +2606,8 @@ def main():
                        help='Analyze JavaScript files for IDOR patterns')
     parser.add_argument('--smart-recon', action='store_true',
                        help='Auto-detect IDOR patterns and exploit')
+    parser.add_argument('--api-test', action='store_true',
+                       help='Comprehensive API IDOR testing (GET/POST/PUT/DELETE)')
     parser.add_argument('--fuzz-range', help='Range for fuzzing (format: 1-100)')
     parser.add_argument('--advanced', action='store_true',
                        help='Enable advanced tests (JWT alg=none, etc.)')
